@@ -1,0 +1,349 @@
+# @title 3. Hyperparamters Grid Search
+# Assuming 'env', 'AnFuelpriceEnv', 'PolicyNetwork', 'ValueNetwork',
+# 'compute_ppo_loss', 'compute_gae', 'compute_policy_loss',
+# 'compute_value_loss', 'compute_entropy_bonus', 'compute_total_ppo_loss',
+# 'multi_categorical_maker', 'FlattenObservationTransformer',
+# 'ProbabilisticActor', 'SyncDataCollector', 'optimizer', 'device',
+# and relevant hyperparameters like 'gamma', 'lambda_', 'value_loss_coef',
+# 'entropy_coef', 'max_grad_norm', 'minibatch_size', 'epochs_per_update'
+# are defined and available from previous cells.
+
+import torch
+import torch.optim as optim
+from tensordict import TensorDict
+from torchrl.modules import ProbabilisticActor # Import ProbabilisticActor
+from torchrl.collectors import SyncDataCollector # Import SyncDataCollector
+import torch.nn.utils as nn_utils
+import random
+from torch.utils.tensorboard import SummaryWriter # Import SummaryWriter for logging
+
+# Define the grid of hyperparameters to search
+# Using a small grid for demonstration purposes
+learning_rates = [1e-4, 3e-4, 1e-3]
+clip_epsilons = [0.1, 0.2, 0.3]
+
+best_mean_reward = -float('inf')
+best_hyperparameters = None
+tuning_results = []
+
+print("Starting hyperparameter grid search...")
+
+# Iterate through each combination of hyperparameters
+for lr in learning_rates:
+    for clip_eps in clip_epsilons:
+        print(f"\n--- Training with LR: {lr}, Clip Epsilon: {clip_eps} ---")
+
+        # Re-instantiate networks, optimizer, and collector with the current hyperparameters
+        # This is necessary because the hyperparameters affect these components.
+
+        # Ensure env is available (it should be from previous successful instantiation)
+        if 'env' not in locals() or env is None:
+             print("Error: Environment not available. Skipping this combination.")
+             continue
+
+        # Instantiate the policy network
+        try:
+            # Get required dimensions from the environment specs (assuming env is valid)
+            num_agents = env.num_agents
+            node_feature_dim = env.node_feature_dim
+            action_spec_composite = env.action_spec[('agents', 'action')]
+            action_spec = action_spec_composite[('agents', 'action')]
+            num_individual_actions_features = action_spec.shape[-1]
+            unique_categories = torch.unique(action_spec.nvec)
+            num_action_categories = unique_categories.item()
+
+            current_policy_network = PolicyNetwork(
+                num_agents=num_agents,
+                node_feature_dim=node_feature_dim,
+                num_individual_actions_features=num_individual_actions_features,
+                num_action_categories=num_action_categories
+            ).to(device)
+
+            # Instantiate the value network
+            current_value_network = ValueNetwork(
+                num_agents=num_agents,
+                node_feature_dim=node_feature_dim
+            ).to(device)
+
+            # Instantiate the optimizer with the current learning rate
+            current_optimizer = optim.Adam(list(current_policy_network.parameters()) + list(current_value_network.parameters()), lr=lr)
+
+            # Wrap the policy network in a ProbabilisticActor for the collector
+            # Need to ensure multi_categorical_maker is available
+            if 'multi_categorical_maker' not in locals():
+                 print("Error: multi_categorical_maker function not found. Cannot create ProbabilisticActor.")
+                 # Clean up instantiated networks/optimizer before continuing to next combo
+                 del current_policy_network, current_value_network, current_optimizer
+                 torch.cuda.empty_cache() # Release GPU memory if applicable
+                 continue
+
+            current_policy_actor = ProbabilisticActor(
+                module=current_policy_network,
+                in_keys=[('agents', 'data')],
+                out_keys=[('agents', 'action')],
+                distribution_class=multi_categorical_maker(),
+                return_log_prob=True,
+            )
+
+
+            # Instantiate the data collector
+            frames_per_batch = env.num_envs # Assuming this is consistent
+            total_frames_per_tuning_run = 5000 # Reduce total frames for faster tuning runs
+
+            current_collector = SyncDataCollector(
+                env,
+                policy=current_policy_actor, # Use the ProbabilisticActor
+                frames_per_batch=frames_per_batch,
+                total_frames=total_frames_per_tuning_run,
+                device=device,
+                storing_device=device,
+            )
+            print("Networks, optimizer, and collector instantiated for current combination.")
+
+        except Exception as e:
+             print(f"An error occurred during setup for LR={lr}, Clip Epsilon={clip_eps}: {e}")
+             # Clean up instantiated networks/optimizer/collector before continuing to next combo
+             if 'current_policy_network' in locals(): del current_policy_network
+             if 'current_value_network' in locals(): del current_value_network
+             if 'current_optimizer' in locals(): del current_optimizer
+             if 'current_policy_actor' in locals(): del current_policy_actor
+             if 'current_collector' in locals(): del current_collector
+             torch.cuda.empty_cache() # Release GPU memory if applicable
+             continue # Skip to the next hyperparameter combination
+
+
+        # --- Training Loop (Simplified for tuning) ---
+        # Run the training loop for a limited number of iterations
+        # Number of training iterations for each tuning run
+        tuning_train_iterations = 50 # Significantly reduced for example
+
+        # Initialize TensorBoard writer for this specific run (optional, for detailed logging per run)
+        # Or just log final performance after evaluation. Let's log final performance for simplicity.
+        # If detailed logging per run is needed, manage separate log directories.
+
+
+        print(f"Starting simplified training for {tuning_train_iterations} iterations...")
+        try:
+            for train_iter in range(tuning_train_iterations):
+                # Collect data
+                collected_data = current_collector.next()
+                collected_data = collected_data.to(device)
+
+                # Extract data (assuming keys are consistent)
+                rewards = collected_data['reward']
+                old_values = collected_data[('old_policy', 'value')]
+                done = collected_data['done']
+                old_log_probs = collected_data[('old_policy', 'log_prob')]
+                actions = collected_data['action']
+                next_old_values = collected_data['next'][('old_policy', 'value')]
+
+                # Compute GAE advantages
+                if done.shape[-2] == 1 and old_values.shape[-2] > 1:
+                     done_for_gae = done.repeat(1, 1, old_values.shape[-2], 1)
+                elif done.shape[-2] == old_values.shape[-2]:
+                     done_for_gae = done
+                else:
+                     print(f"Error: done shape {done.shape} not compatible for GAE. Skipping iteration.")
+                     continue # Skip this training iteration
+
+                B, T, num_agents, _ = old_values.shape
+                flat_rewards = rewards.view(B * num_agents, T, 1)
+                flat_old_values = old_values.view(B * num_agents, T, 1)
+                flat_done_for_gae = done_for_gae.view(B * num_agents, T, 1)
+
+                advantages = compute_gae(flat_rewards, flat_old_values, gamma, lambda_, flat_done_for_gae)
+                advantages = advantages.view(B, T, num_agents, 1) # Reshape back
+
+                # Compute target values
+                target_values = advantages + old_values
+
+                # Flatten data for minibatches
+                node_feature_dim = env.node_feature_dim # Ensure this is available
+                num_individual_actions_features = env.num_individual_actions_features # Ensure this is available
+
+                flat_obs_x = collected_data[('agents', 'data', 'x')].view(B * T, num_agents, node_feature_dim)
+                flat_actions = actions.view(B * T, num_agents, num_individual_actions_features)
+                flat_old_log_probs = old_log_probs.view(B * T, 1)
+                flat_advantages = advantages.view(B * T, num_agents, 1)
+                flat_target_values = target_values.view(B * T, num_agents, 1)
+
+                flat_tensordict = TensorDict({
+                    ('agents', 'data', 'x'): flat_obs_x,
+                    'action': flat_actions,
+                    ('old_policy', 'log_prob'): flat_old_log_probs,
+                    'advantages': flat_advantages,
+                    'target_values': flat_target_values,
+                }, batch_size=[B * T]).to(device)
+
+
+                # Iterate over epochs and minibatches
+                for epoch in range(epochs_per_update): # Use the general epochs_per_update
+                    indices = list(range(B * T))
+                    random.shuffle(indices)
+
+                    for start_idx in range(0, B * T, minibatch_size): # Use the general minibatch_size
+                        end_idx = min(start_idx + minibatch_size, B * T)
+                        minibatch_indices = indices[start_idx:end_idx]
+                        minibatch_tensordict = flat_tensordict[minibatch_indices]
+
+                        current_optimizer.zero_grad()
+
+                        # Compute PPO loss (assuming compute_ppo_loss takes the correct inputs)
+                        # Note: compute_ppo_loss internally calls policy and value modules.
+                        # It expects a tensordict with required keys.
+                        # We pass the minibatch_tensordict which has the collected data,
+                        # and the current policy/value networks for the forward pass.
+
+                        # Modify compute_ppo_loss call to use current_policy_network and current_value_network
+                        # If compute_ppo_loss needs gamma/lambda, pass them.
+                        # The existing compute_ppo_loss seems to expect gamma/lambda but uses pre-computed advantages/targets.
+                        # Let's use the pre-computed advantages/targets and current networks to compute new logits/values.
+                        # Re-implementing the loss computation part directly here for clarity in tuning context.
+
+                        # Forward pass through current networks
+                        minibatch_tensordict_processed = minibatch_tensordict.clone()
+                        # Policy forward pass (should add action_dist)
+                        current_policy_network(minibatch_tensordict_processed)
+                        # Value forward pass (should add state_value)
+                        current_value_network(minibatch_tensordict_processed)
+
+                        # Compute loss components
+                        # New log probs (from new policy, using old actions)
+                        new_log_probs_minibatch = minibatch_tensordict_processed['action_dist'].log_prob(minibatch_tensordict['action']).unsqueeze(-1)
+                        # Old log probs
+                        old_log_probs_minibatch = minibatch_tensordict[('old_policy', 'log_prob')]
+                        # Advantages (mean over agents for policy loss)
+                        mean_advantages_minibatch = torch.mean(minibatch_tensordict['advantages'], dim=-2, keepdim=True)
+                        # Policy loss
+                        policy_loss = compute_policy_loss(
+                            new_log_probs_minibatch,
+                            old_log_probs_minibatch,
+                            mean_advantages_minibatch,
+                            clip_eps # Use the current clip_epsilon from the grid search
+                        )
+
+                        # New values
+                        new_values_minibatch = minibatch_tensordict_processed[('agents', 'state_value')]
+                        # Target values
+                        target_values_minibatch = minibatch_tensordict['target_values']
+                        # Value loss
+                        value_loss = compute_value_loss(
+                            new_values_minibatch,
+                            target_values_minibatch
+                        )
+
+                        # Entropy bonus
+                        policy_distribution_minibatch = minibatch_tensordict_processed['action_dist']
+                        entropy_bonus = compute_entropy_bonus(policy_distribution_minibatch)
+
+                        # Total loss
+                        total_loss = compute_total_ppo_loss(
+                            policy_loss,
+                            value_loss,
+                            entropy_bonus,
+                            value_loss_coef, # Use the general value_loss_coef
+                            entropy_coef # Use the general entropy_coef
+                        )
+
+
+                        # Backward pass and optimization
+                        total_loss.backward()
+                        if max_grad_norm is not None: # Use the general max_grad_norm
+                            nn_utils.clip_grad_norm_(current_optimizer.param_groups[0]['params'], max_grad_norm)
+                        current_optimizer.step()
+
+            # Training loop for this combination finished.
+            print(f"Simplified training finished for LR: {lr}, Clip Epsilon: {clip_eps}.")
+
+        except Exception as e:
+             print(f"An error occurred during simplified training for LR={lr}, Clip Epsilon={clip_eps}: {e}")
+             # Clean up instantiated networks/optimizer/collector before continuing to next combo
+             if 'current_policy_network' in locals(): del current_policy_network
+             if 'current_value_network' in locals(): del current_value_network
+             if 'current_optimizer' in locals(): del current_optimizer
+             if 'current_policy_actor' in locals(): del current_policy_actor
+             if 'current_collector' in locals(): del current_collector
+             torch.cuda.empty_cache() # Release GPU memory if applicable
+             continue # Skip evaluation and logging for this failed run
+
+
+        # --- Evaluation ---
+        print("Starting evaluation for the trained policy...")
+        # Assuming eval_env and multi_categorical_maker are available from previous cells
+        if 'eval_env' not in locals() or eval_env is None or 'multi_categorical_maker' not in locals():
+             print("Evaluation environment or maker function not available. Skipping evaluation.")
+             # Clean up instantiated networks/optimizer/collector before continuing to next combo
+             if 'current_policy_network' in locals(): del current_policy_network
+             if 'current_value_network' in locals(): del current_value_network
+             if 'current_optimizer' in locals(): del current_optimizer
+             if 'current_policy_actor' in locals(): del current_policy_actor
+             if 'current_collector' in locals(): del current_collector
+             torch.cuda.empty_cache() # Release GPU memory if applicable
+             continue
+
+
+        num_eval_episodes = 3 # Reduced number of evaluation episodes for tuning
+        episode_rewards = []
+
+        try:
+            # Create evaluation policy (deterministic) using the current trained policy_network
+            eval_policy = ProbabilisticActor(
+                module=current_policy_network, # Use the policy network just trained
+                in_keys=[('agents', 'data')],
+                out_keys=[('agents', 'action')],
+                distribution_class=multi_categorical_maker(),
+                return_log_prob=False,
+            ).to(device)
+            eval_policy.set_deterministic_mode(True) # Set to deterministic mode
+
+
+            for episode in range(num_eval_episodes):
+                eval_tensordict = eval_env.reset()
+                done = eval_tensordict['done']
+                total_episode_reward = 0.0
+
+                while not done.all():
+                    with torch.no_grad():
+                        eval_tensordict = eval_policy(eval_tensordict)
+                    eval_tensordict = eval_env.step(eval_tensordict)
+
+                    if ('agents', 'reward') in eval_tensordict['next'].keys(include_nested=True):
+                         step_reward = eval_tensordict['next'][('agents', 'reward')].sum().item()
+                         total_episode_reward += step_reward
+
+                    done = eval_tensordict['next']['done']
+
+                episode_rewards.append(total_episode_reward)
+
+            mean_eval_reward = sum(episode_rewards) / num_eval_episodes
+            print(f"Evaluation finished. Mean episode reward: {mean_eval_reward:.2f}")
+
+        except Exception as e:
+            print(f"An error occurred during evaluation for LR={lr}, Clip Epsilon={clip_eps}: {e}")
+            mean_eval_reward = -float('inf') # Assign a very low reward on error
+
+
+        # --- Store Results and Track Best ---
+        tuning_results.append({
+            'learning_rate': lr,
+            'clip_epsilon': clip_eps,
+            'mean_eval_reward': mean_eval_reward
+        })
+
+        if mean_eval_reward > best_mean_reward:
+            best_mean_reward = mean_eval_reward
+            best_hyperparameters = {'learning_rate': lr, 'clip_epsilon': clip_eps}
+            print(f"New best hyperparameters found: {best_hyperparameters} with mean reward: {best_mean_reward:.2f}")
+
+
+        # Clean up instantiated networks/optimizer/collector after each run to free memory
+        del current_policy_network, current_value_network, current_optimizer, current_policy_actor, current_collector, eval_policy
+        torch.cuda.empty_cache() # Release GPU memory if applicable
+
+
+print("\nHyperparameter grid search finished.")
+print("Tuning Results:")
+for result in tuning_results:
+    print(result)
+
+print(f"\nBest Hyperparameters found: {best_hyperparameters} with mean reward: {best_mean_reward:.2f}")
