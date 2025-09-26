@@ -7,8 +7,12 @@ setup(
     install_requires=[
         'torch',
         'torch_geometric',
-        'pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv',
-        'networkx'
+        'pyg_lib',
+        'torch_scatter',
+        'torch_sparse',
+        'torch_cluster',
+        'torch_spline_conv',
+        'networkx',
         'torchrl',
         'tensordict',
         'pandas',
