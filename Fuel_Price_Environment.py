@@ -2,7 +2,8 @@ import pandas as pd
 import os
 import networkx as nx
 import random
-from torch_geometric.nn import GCNConv, global_mean_pool # Import global_mean_pool
+import torch # Import torch
+from torch_geometric.nn import GCNConv # Import GCNConv
 from torch_geometric.nn import SplineConv
 from torch_geometric.nn import global_mean_pool as gap, global_max_pool as gmp
 from tensordict import TensorDict, TensorDictBase
@@ -12,7 +13,6 @@ from torchrl.data import Unbounded, Categorical, Composite, DiscreteTensorSpec, 
 
 from typing import Optional
 import numpy as np
-import torch # Import torch
 from tensordict.nn import TensorDictModuleBase # Import TensorDictModuleBase
 from torchrl.envs.utils import check_env_specs # Keep check_env_specs
 
@@ -741,86 +741,298 @@ class FuelpriceEnv(EnvBase):
         return output_tensordict
 
 
-# Assuming AnFuelpriceEnv is now defined above in this cell
-# Instantiate the environment
-#num_envs = 4 # You can adjust the number of environments
-#seed = 0
-#device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#try:
-#    env = AnFuelpriceEnv(num_envs=num_envs, seed=seed, device=device, episode_length=10) # Reduced episode_length for a quick test
-#    print("\nEnvironment instantiated successfully.")
-#except Exception as e:
-#    print(f"\nCould not re-instantiate env with correct batch size: {e}")
-#    env = None
+# Implement the actual _is_terminal method
+    def _is_terminal(self) -> torch.Tensor:
+        """
+        Determines if the current state is a terminal state.
+
+        Returns:
+            torch.Tensor: A boolean tensor of shape [num_envs] indicating
+                          whether each environment is in a terminal state.
+        """
+        # --- Implement your actual episode termination logic here ---
+        # Example: Terminate if a certain prediction error threshold is crossed,
+        #          or if the episode has gone on for too long (handled by truncated).
+
+        # For now, keeping it as always False, allowing episodes to end only by truncation.
+        # Replace this with your specific termination conditions.
+        terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        # Example termination based on a hypothetical error threshold (replace with your logic):
+        # if self.current_data_index > 0: # Avoid checking at step 0
+        #     # Assuming you have access to predicted and actual prices somewhere
+        #     # Example: hypothetical 'predicted_price' and 'actual_price' in your state or data
+        #     # (You'll need to adapt this based on your actual data structure and how predictions are made)
+        #     predicted_price = ... # Get predicted price based on current state/data and actions
+        #     actual_price = ...    # Get actual price from your data at current_data_index + 1 (next step)
+        #     error = torch.abs(predicted_price - actual_price)
+        #     error_threshold = 10.0 # Define your threshold
+        #     terminated = error > error_threshold
+
+        return terminated
 
 
-# Check environment specs (if env is available)
-#if env is not None:
-#    print("\nChecking environment specs...")
-    # check_env_specs(env) # Temporarily comment out check_env_specs
-#    print("Skipping check_env_specs to proceed.")
+    # Implement the actual _batch_reward method
+    def _batch_reward(self, data_index: torch.Tensor, tensordict: TensorDictBase) -> TensorDictBase:
+        """
+        Calculates the reward for a batch of environments.
+
+        Args:
+            data_index (torch.Tensor): A tensor of shape [num_envs] indicating the
+                                         current data index for each environment.
+            tensordict (TensorDictBase): The input tensordict containing the
+                                         current state and actions.
+
+        Returns:
+            TensorDictBase: A tensordict containing the reward for each environment
+                            and agent, with shape [num_envs, num_agents, 1].
+        """
+        # --- Implement your actual reward calculation logic here ---
+        # The reward should reflect how well the agent's actions contribute
+        # to the fuel price prediction task goals.
+
+        # Access actions from the input tensordict
+        # The shape of actions is [num_envs, num_agents, num_individual_actions_features]
+        actions=tensordict.get(('agents', 'action')) # Use .get() for safety
+
+        # Access the returns data from self.combined_data based on the current data_index.
+        # The returns data is the first half of the 'Indep' part of combined_data.
+        # 'Indep' has shape [num_timesteps, 2 * num_agents].
+        # The returns for all agents at data_index are at self.combined_data[data_index, self.num_agents : 2 * self.num_agents].
+        # We need to handle the batch of environments, so we index with data_index for each environment.
+        # data_index is a tensor of shape [num_envs].
+        # We need to gather the data for each environment's current_data_index.
+
+        # Ensure data_index + 1 is within bounds of combined_data for accessing the next step's returns
+        # (Rewards are typically given after taking an action and transitioning to the next state,
+        # so the reward at step t is based on the transition from state t to state t+1,
+        # and thus uses data from time t+1. The returns at index i in combined_data represent
+        # the change from time i to i+1. So for reward at step 'data_index', we need returns at 'data_index').
+
+        # Check bounds for accessing combined_data at data_index
+        valid_indices = data_index < self.combined_data.shape[0]
+
+        # Initialize reward tensor with shape [num_envs, num_agents, 1] and zeros
+        reward = torch.zeros(self.num_envs, self.num_agents, 1, dtype=torch.float32, device=self.device)
+
+        # Calculate reward only for valid environments
+        if valid_indices.any():
+            # Get the relevant data indices for valid environments
+            valid_data_indices = data_index[valid_indices] # Shape: [num_valid_envs]
+
+            # Access the returns data for the valid environments at their respective data_indices
+            # The returns for all agents at a given time step are columns self.num_agents to 2*self.num_agents
+            # in the combined_data.
+            # We need to use advanced indexing to get the returns for each environment at its specific index.
+            # combined_data shape: [total_timesteps, total_features]
+            # valid_data_indices shape: [num_valid_envs]
+            # We want combined_data[valid_data_indices, self.num_agents : 2 * self.num_agents]
+            # This will give a tensor of shape [num_valid_envs, num_agents]
+            returns_for_valid_envs = self.combined_data[valid_data_indices, self.num_agents : 2 * self.num_agents] # Shape: [num_valid_envs, num_agents]
+
+            # Calculate the absolute value of returns as the reward
+            # The reward should be agent-wise, so the shape should be [num_valid_envs, num_agents, 1]
+            calculated_reward = torch.abs(returns_for_valid_envs).unsqueeze(-1) # Shape: [num_valid_envs, num_agents, 1]
+
+            # Assign the calculated rewards to the reward tensor for the valid environments
+            reward[valid_indices] = calculated_reward
 
 
-# Instantiate the collector without a policy (This part might be commented out or removed later)
-# This collector will collect random actions from the environment's action space
-# collector = SyncDataCollector(
-#     env,
-#     policy=None, # No policy is provided, so it will sample random actions
-#     frames_per_batch=env.num_envs, # Collect one step from each environment per batch
-#     total_frames=100, # Total frames to collect for the test
-#     device=device,
-#     storing_device=device,
-# )
-
-# print("\nCollector instantiated.")
-# print(f"Collector total frames: {collector.total_frames}")
-# print(f"Collector frames per batch: {collector.frames_per_batch}")
-
-# Run a small rollout to test (This part might be commented out or removed later)
-# print("\nRunning a small test rollout...")
-# try:
-#     for i, data in enumerate(collector):
-#         print(f"\n--- Collected Batch {i+1} ---")
-#         print(f"Collected data keys: {data.keys(include_nested=True)}")
-#         print(f"Collected data shape: {data.shape}")
-
-#         # Access and print some information from the collected tensordict
-#         if "next" in data.keys() and ("agents", "data", "x") in data["next"].keys(include_nested=True):
-#             print(f"Shape of next observation 'x': {data['next'][('agents', 'data', 'x')].shape}")
-#             print(f"Sample of next observation 'x': {data['next'][('agents', 'data', 'x')][0, 0, :5]}...") # Print sample for first env, first agent, first 5 features
-#         else:
-#              print("Next observation 'x' not found in collected data.")
-
-#         if "reward" in data["next"].keys(): # Rewards are under "next" at the root level in rollout tensordicts
-#              print(f"Shape of next reward: {data['next']['reward'].shape}") # Reward shape should be [batch_size, 1] or [batch_size, num_agents, 1] depending on how it's structured by the env
-#              # Adjust indexing based on the reward structure returned by your env's _step and how the collector handles it
-#              # If your env returns ('agents', 'reward') with shape [num_envs, num_agents, 1] at the root of the _step output,
-#              # the collector will place this under "next" and the shape will be [batch_size, num_envs, num_agents, 1]
-#              # If your env returns 'reward' at the root with shape [num_envs, 1] (global reward), the collector places it under "next" with shape [batch_size, num_envs, 1]
-#              # Based on your env's _make_specs and _batch_reward, the agent-wise reward ('agents', 'reward') should be what is passed.
-#              # The collector will likely put this under next, with the batch_size prepended.
-#              if ('agents', 'reward') in data["next"].keys(include_nested=True):
-#                   print(f"Shape of next agent-wise reward: {data['next'][('agents', 'reward')].shape}")
-#                   print(f"Sample of next agent-wise reward: {data['next'][('agents', 'reward')][0, 0, :5]}...") # Print sample for first batch, first env, first 5 agents
-#              else:
-#                   print("Next agent-wise reward ('agents', 'reward') not found in collected data.")
-
-#         if "done" in data["next"].keys(): # Done flags are under "next" at the root level
-#              print(f"Shape of next done flags: {data['next']['done'].shape}")
-#              print(f"Sample of next done flags: {data['next']['done'][:5]}...") # Print sample for first 5 batches
-#         else:
-#              print("Next done flags not found in collected data.")
+        # Create a tensordict to return the reward, nested under ('agents', 'reward')
+        # Ensure the shape matches the reward_spec: [num_envs, num_agents, 1]
+        reward_tensordict_output = TensorDict({
+            ('agents', 'reward'): reward # Place reward under ('agents', 'reward')
+        }, batch_size=[self.num_envs], device=self.device)
 
 
-#         if i >= 2: # Collect only a few batches for the test
-#             break
+        return reward_tensordict_output
 
-# except Exception as e:
-#     print(f"\nAn error occurred during the test rollout: {e}")
 
-# print("\nTest rollout finished.")
 
-# You can further inspect the 'data' tensordict collected in the loop.
-# For example, after the loop, 'data' will hold the last collected batch.
-# print("\nLast collected batch:")
-# print(data)
+
+    def _step(self, tensordict: TensorDictBase) -> TensorDictBase:
+        self.current_data_index += 1
+
+        terminated = self._is_terminal()
+        truncated = (self.current_data_index >= self.episode_length)
+
+        # The action is now expected to be in the input tensordict passed to step() by the collector
+        # It should be at tensordict[('agents', 'action')]
+        actions=tensordict.get(('agents', 'action')) # Use .get() here as well
+        # Pass the input tensordict directly to _batch_reward
+        # _batch_reward will need to extract the action from this tensordict
+        # Get the reward tensordict from _batch_reward
+        reward_td = self._batch_reward(self.current_data_index, tensordict)
+
+
+        # Logic previously in _get_state_at for next state
+        num_envs = self.current_data_index.shape[0]
+
+        # Get data indices for the next step, handling boundaries
+        data_indices = torch.min(self.current_data_index + 1, torch.as_tensor(self.combined_data.shape[0] - 1, device=self.device))
+        # Extract the first node_feature_dim columns for each environment
+        # If all agents share the same features, extract and then expand
+        x_data_time_step = self.combined_data[data_indices, :self.node_feature_dim] # Shape: [num_envs, node_feature_dim]
+        # Expand to [num_envs, num_agents, node_feature_dim]
+        x_data = x_data_time_step.unsqueeze(1).expand(-1, self.num_agents, -1)
+
+        # Use fixed edge index repeated for the batch
+        edge_index_data = self._fixed_edge_index_single.unsqueeze(0).repeat(num_envs, 1, 1).to(self.device)
+        print(f"_step: Using fixed edge index. Generated edge_index_data shape = {edge_index_data.shape}")
+
+
+        next_state_tensordict_data = TensorDict({
+             "x": x_data, # Use actual data for node features
+             "edge_index": edge_index_data, # Placeholder edge indices
+             "batch": torch.arange(num_envs, device=self.device).repeat_interleave(self.num_agents).view(num_envs, self.num_agents), # Placeholder batch tensor
+             "time": self.current_data_index.unsqueeze(-1).to(self.device), # Use the provided data_index as timestamp
+        }, batch_size=[self.num_envs], device=self.device)
+
+
+        # Create the output tensordict containing the next observation, reward, and done flags
+        # The next observation and reward should be nested under "next" by the collector.
+        # The done flags should be at the root level of the tensordict returned by _step.
+        # Structure the output tensordict with reward and done flags at the root level
+        output_tensordict = TensorDict({
+            # Include the next observation structure under ("agents", "data")
+            ("agents", "data"): next_state_tensordict_data,
+            # Include the reward at the root level using the key from reward_td
+            # The reward_td contains the reward under ('agents', 'reward')
+            ('agents', 'reward'): reward_td.get(('agents', 'reward')), # Get reward from reward_td using the correct key
+            # Include the done flags at the root level
+            "terminated": terminated.unsqueeze(-1), # Ensure shape matches spec [num_envs, 1]
+            "truncated": truncated.unsqueeze(-1), # Ensure shape matches spec [num_envs, 1]
+            "done": (terminated | truncated).unsqueeze(-1), # Ensure shape matches spec [num_envs, 1]
+
+        }, batch_size=[self.num_envs], device=self.device)
+
+
+        # Return the output_tensordict
+        return output_tensordict
+
+
+
+
+    def _reset(self, tensordict: Optional[TensorDictBase] = None) -> TensorDictBase:
+        if self.allow_repeat_data and self.combined_data is not None:
+             max_start_index = self.combined_data.shape[0] - self.episode_length -1
+             if max_start_index < 0:
+                  self.current_data_index = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
+                  print("Warning: Data length is less than episode_length + 1. Starting episodes from index 0.")
+             else:
+                  self.current_data_index = torch.randint(0, max_start_index + 1, (self.num_envs,), dtype=torch.int64, device=self.device)
+        else:
+             self.current_data_index = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
+
+        # Logic previously in _get_state_at for initial state
+        num_envs = self.current_data_index.shape[0]
+
+        # Get data indices for the initial state
+        data_indices = self.current_data_index
+        # Extract the first node_feature_dim columns for each environment
+        # If all agents share the same features, extract and then expand
+        x_data_time_step = self.combined_data[data_indices, :self.node_feature_dim] # Shape: [num_envs, node_feature_dim]
+        # Expand to [num_envs, num_agents, node_feature_dim]
+        x_data = x_data_time_step.unsqueeze(1).expand(-1, self.num_agents, -1)
+
+        # Use fixed edge index repeated for the batch
+        edge_index_data = self._fixed_edge_index_single.unsqueeze(0).repeat(num_envs, 1, 1).to(self.device)
+        print(f"_reset: Using fixed edge index. Generated edge_index_data shape = {edge_index_data.shape}")
+
+
+        initial_state_tensordict_data = TensorDict({
+             "x": x_data, # Use actual data for node features
+             "edge_index": edge_index_data, # Placeholder edge indices
+             "batch": torch.arange(num_envs, device=self.device).repeat_interleave(self.num_agents).view(num_envs, self.num_agents), # Placeholder batch tensor
+             "time": self.current_data_index.unsqueeze(-1).to(self.device), # Use the provided data_index as timestamp
+        }, batch_size=[num_envs], device=self.device)
+
+
+        # Create the tensordict to return, containing the initial observation and done flags
+        # The initial observation should be nested under ("agents", "data")
+
+        output_tensordict = TensorDict({
+            # Include the initial observation structure
+            ("agents", "data"): initial_state_tensordict_data,
+            # Set initial done, terminated, truncated flags to False at the root level
+            # Corrected shapes to [num_envs, 1] to match done_spec
+            "terminated": torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device),
+            "truncated": torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device),
+            "done": torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device),
+             # Removed nested done, terminated, truncated keys from reset output
+            # ("agents", "terminated"): torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device),
+            # ("agents", "truncated"): torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device),
+            # ("agents", "done"): torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device),
+        }, batch_size=[self.num_envs], device=self.device)
+
+
+        # Removed all debugging print statements from _reset
+        # print("\n--- Environment _reset output tensordict ---")
+        # print(f"Output tensordict keys: {output_tensordict.keys(include_nested=True)}") # Added include_nested=True
+        # # Also print keys of nested observation tensordict, changed 'observation' to 'data'
+        # if ("agents", "data") in output_tensordict.keys(include_nested=True): # Added include_nested=True
+        #      nested_obs_td = output_tensordict.get(("agents", "data"))
+        #      print(f"  Nested ('agents', 'data') keys: {nested_obs_td.keys(include_nested=True)}") # Added include_nested=True
+        #      print(f"  Nested ('agents', 'data') shape: {nested_obs_td.shape}")
+        #      if ("x") in nested_obs_td.keys():
+        #          print(f"  Nested ('agents', 'data', 'x') shape: {output_tensordict.get(('agents', 'data', 'x')).shape}")
+        #          print(f"  Nested ('agents', 'data', 'x') dtype: {output_tensordict.get(('agents', 'data', 'x')).dtype}")
+        #      else:
+        #           print("  Nested ('agents', 'data', 'x') key NOT found.")
+        #      # Check for timestamp key
+        #      if "time" in nested_obs_td.keys():
+        #           print(f"  Nested ('agents', 'data', 'time') value sample: {output_tensordict.get(('agents', 'data', 'time'))[0][:5]}...")
+        #      else:
+        #           print("  Nested ('agents', 'data', 'time') key NOT found.")
+
+        # else:
+        #      print("  Nested ('agents', 'data') key NOT found in output_tensordict.")
+        # # Print done keys to verify their location
+        # if ("done") in output_tensordict.keys():
+        #      print(f"  ('done') value: {output_tensordict.get(('done')))}")
+        # if ("terminated") in output_tensordict.keys():
+        #      # Fixed the unmatched parenthesis here
+        #      print(f"  ('terminated') value: {output_tensordict.get(('terminated')))}")
+        # if ("truncated") in output_tensordict.keys():
+        #      # Fixed the unmatched parenthesis here
+        #      print(f"  ('truncated') value: {output_tensordict.get(('truncated')))}")
+        # if ("agents", "done") in output_tensordict.keys(include_nested=True):
+        #      print(f"  ('agents', 'done') value: {output_tensordict.get(('agents', 'done')))}")
+        # if ("agents", "terminated") in output_tensordict.keys(include_nested=True):
+        #      print(f"  ('agents', 'terminated') value: {output_tensordict.get(('agents', 'terminated')))}")
+        # if ("agents", "truncated") in output_tensordict.keys(include_nested=True):
+        #      print(f"  ('truncated') value: {output_tensordict.get(('truncated')))}")
+        # # Print batch key to verify its location, changed 'observation' to 'data'
+        # if ('agents', 'data', 'batch') in output_tensordict.keys(include_nested=True):
+        #      print(f"  ('agents', 'data', 'batch') value sample: {output_tensordict.get(('agents', 'data', 'batch'))[0][:5]}...") # Print sample of batch tensor
+
+
+        # print("-------------------------------------------")
+
+
+        return output_tensordict
+
+
+# Create a new instance of the environment specifically for evaluation
+# Use the same num_envs, seed, and device as used for training.
+# Do not apply training-specific transformations.
+# Set the episode_length for evaluation.
+
+print("Creating evaluation environment...")
+try:
+    # Use the same num_envs, seed, and device from previous cells
+    # Assuming env, num_envs, seed, and device variables are available from previous steps
+    eval_env = FuelpriceEnv(num_envs=num_envs, seed=seed, device=device, num_agents=num_agents, episode_length=100) # Use a reasonable episode length for evaluation
+
+    print("\nEvaluation environment instantiated successfully.")
+    print(f"Evaluation environment batch size: {eval_env.batch_size}")
+    print(f"Evaluation environment device: {eval_env.device}")
+    print(f"Evaluation environment episode length: {eval_env.episode_length}")
+
+    # Verify the state spec of the evaluation environment
+    print("\nEvaluation environment state spec:")
+    print(eval_env.state_spec)
+
+except Exception as e:
+    eval_env = None
+    print(f"\nAn error occurred during evaluation environment instantiation: {e}")
