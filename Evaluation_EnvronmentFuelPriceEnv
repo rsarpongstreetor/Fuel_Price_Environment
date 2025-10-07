@@ -1,0 +1,425 @@
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+from torchrl.envs import EnvBase, GymLikeDeterministicWrapper
+from torchrl.data.tensor_specs import CompositeSpec, UnboundedContinuous, UnboundedDiscrete, OneHotDiscrete, MultiCategorical
+from tensordict import TensorDict, TensorDictBase
+from tensordict.nn import TensorDictModule
+import networkx as nx
+from torch_geometric.utils import from_networkx
+from torch.distributions import Distribution, constraints
+from torch.distributions.categorical import Categorical as TorchCategorical
+from torchrl.data.tensor_specs import DiscreteTensorSpec
+from typing import Optional
+from torchrl.collectors import SyncDataCollector
+import os
+
+
+# --- FuelpriceenvfeatureGraph Class (Supporting Environment) ---
+# (Copying from the previous successful definition)
+
+class FuelpriceenvfeatureGraph():
+
+    def __init__(self):
+        self.graph = nx.DiGraph()
+        self.graph.graph["graph_attr_1"] = random.random() * 10
+        self.graph.graph["graph_attr_2"] = random.random() * 5.
+        self.num_nodes_per_graph = 13
+        self._first_feature_col_idx = 0
+
+
+    def _load_data(self):
+        from scipy.stats import zscore
+        import pandas as pd
+        import numpy as np
+        import os
+
+
+
+        local_data_path = '/content/anfuelpriceenv/Cleaneddata (5).csv'
+
+
+        if os.path.exists(local_data_path):
+            data_df = pd.read_csv(local_data_path)
+            print(f"Successfully loaded data from {local_data_path}")
+        else:
+            print(f"Error: Data file not found at {local_data_path}. Please ensure it was downloaded.")
+            data_df = None
+            raise FileNotFoundError(f"Data file not found at {local_data_path}")
+
+
+        try:
+            csv_column_names = [
+                'USD_SDR', 'OPEC', 'Brent', 'WTI', "('Date',)",
+                "('EER_EPD2DC_PF4_Y05LA_DPG',)", "('EER_EPD2DXL0_PF4_RGC_DPG',)",
+                "('EER_EPD2DXL0_PF4_Y35NY_DPG',)", "('EER_EPD2F_PF4_Y35NY_DPG',)",
+                "('EER_EPJK_PF4_RGC_DPG',)", "('EER_EPLLPA_PF4_Y44MB_DPG',)",
+                "('EER_EPMRR_PF4_Y05LA_DPG',)", "('EER_EPMRU_PF4_RGC_DPG',)",
+                "('EER_EPMRU_PF4_Y35NY_DP',)"
+            ]
+
+            dffff = data_df.copy()
+            dffff = pd.read_csv(
+                local_data_path,
+                header=0,
+                names=csv_column_names,
+                parse_dates=["('Date',)"]
+            )
+
+            dffff = dffff.set_index("('Date',)")
+            dffff = dffff.ffill()
+            dffff.dropna(axis=0, how='any', inplace=True)
+
+            numeric_cols_dffff = dffff.select_dtypes(include=np.number)
+            abs_z_scores_dffff = numeric_cols_dffff.apply(lambda x: np.abs(zscore(x, ddof=0)) if x.std() != 0 else pd.Series(0, index=x.index))
+            threshold = 3
+            outliers_dffff = abs_z_scores_dffff > threshold
+            dffff.loc[:, numeric_cols_dffff.columns][outliers_dffff] = 0
+            print(f"Loading data (allow_repeat_data: {self.allow_repeat_data})...")
+
+            feature_columns = [
+                'USD_SDR', 'OPEC', 'Brent', 'WTI',
+                "('EER_EPD2DC_PF4_Y05LA_DPG',)", "('EER_EPD2DXL0_PF4_RGC_DPG',)",
+                "('EER_EPD2DXL0_PF4_Y35NY_DPG',)", "('EER_EPD2F_PF4_Y35NY_DPG',)",
+                "('EER_EPJK_PF4_RGC_DPG',)", "('EER_EPLLPA_PF4_Y44MB_DPG',)",
+                "('EER_EPMRR_PF4_Y05LA_DPG',)", "('EER_EPMRU_PF4_RGC_DPG',)",
+                "('EER_EPMRU_PF4_Y35NY_DP',)"
+            ]
+
+            features_df = dffff[feature_columns].select_dtypes(include=np.number)
+            numberr_np = features_df.values
+
+            def returns(x):
+              x = np.array(x)
+              return x[1:, :] - x[:-1, :]
+            RRRR = returns(numberr_np)
+
+            def actionspace(x):
+              x = np.array(x)
+              differences = x[1:, :] - x[:-1, :]
+              yxx = np.zeros_like(differences)
+              yxx[differences > 0] = 2
+              yxx[differences < 0] = 0
+              yxx[differences == 0] = 1
+              return yxx
+            action = actionspace(numberr_np)
+
+            Indep = np.hstack((RRRR, action))
+            features_aligned_np = numberr_np[1:, :]
+            self.combined_data = np.hstack([features_aligned_np, Indep])
+
+            if np.isnan(self.combined_data).any() or np.isinf(self.combined_data).any():
+                print("Warning: NaNs or Infs found in combined_data numpy array before tensor conversion. Replacing with 0.")
+                self.combined_data[np.isnan(self.combined_data)] = 0.0
+                self.combined_data[np.isinf(self.combined_data)] = 0.0
+                print("NaNs and Infs successfully replaced in numpy array.")
+
+            print(f"  Shape of combined_data after replacement (numpy): {self.combined_data.shape}")
+            print(f"  Sample of combined_data after replacement (numpy):\n{self.combined_data[:5, :5]}...")
+
+
+            print(f"Attempting to convert combined_data to torch tensor on device {self.device}...")
+            self.combined_data = torch.as_tensor(self.combined_data, dtype=torch.float32, device=self.device)
+            print("Conversion to torch tensor successful.")
+
+            if torch.isnan(self.combined_data).any() or torch.isinf(self.combined_data).any():
+                 print("Error: NaNs or Infs found in the PyTorch tensor after conversion.")
+                 self.combined_data = torch.nan_to_num(self.combined_data, nan=0.0, posinf=0.0, neginf=0.0)
+                 print("NaNs and Infs replaced in PyTorch tensor.")
+            else:
+                 print("No NaNs or Infs found in the PyTorch tensor.")
+
+
+            self.obs_min = torch.min(self.combined_data[:, :self.num_nodes_per_graph], dim=0)[0].unsqueeze(-1).to(self.device)
+            self.obs_max = torch.max(self.combined_data[:, :self.num_nodes_per_graph], dim=0)[0].unsqueeze(-1).to(self.device)
+
+
+            return self.combined_data
+
+
+        except Exception as e:
+            print(f"An error occurred during data loading: {e}")
+            self.combined_data = None
+            raise
+
+
+# --- FuelpriceEnv Class ---
+# (Copying from the previous successful definition)
+
+class FuelpriceEnv(EnvBase):
+    def __init__(self, num_envs, seed, device, num_agents=5, episode_length=100, data_path="/content/anfuelpriceenv/Cleaneddata (5).csv", allow_repeat_data=False, **kwargs):
+        self.episode_length = episode_length
+        self.num_agents = num_agents
+        self.allow_repeat_data = allow_repeat_data
+        self.num_envs = num_envs
+        self.current_data_index = torch.zeros(num_envs, dtype=torch.int64, device=device)
+
+        self.graph_generator = FuelpriceenvfeatureGraph()
+
+        self.device = device
+
+        self.graph_generator.num_nodes_per_graph = self.num_agents
+        self.graph_generator.device = self.device
+        self.graph_generator.allow_repeat_data = self.allow_repeat_data
+
+        self.combined_data = self.graph_generator._load_data()
+
+        self.node_feature_dim = 1
+
+        self.num_individual_actions_features = 13
+
+        self.num_individual_actions = 3
+
+        self.num_nodes_per_graph = self.num_agents
+        self.num_edges_per_graph = self.num_agents if self.num_agents > 1 else 0
+        print(f"AnFuelpriceEnv.__init__: num_edges_per_graph calculated as {self.num_edges_per_graph}")
+
+        if self.num_agents > 1:
+            sources = torch.arange(self.num_agents)
+            targets = (torch.arange(self.num_agents) + 1) % self.num_agents
+            self._fixed_edge_index_single = torch.stack([sources, targets], dim=0).to(torch.long)
+            self._fixed_num_edges_single = self._fixed_edge_index_single.shape[1]
+        else:
+            self._fixed_edge_index_single = torch.empty(2, 0, dtype=torch.long)
+            self._fixed_num_edges_single = 0
+
+
+        if self.combined_data is not None and self.combined_data.shape[1] >= 13:
+             self.obs_min = torch.min(self.combined_data[:, :13], dim=0)[0].unsqueeze(-1).to(self.device)
+             self.obs_max = torch.max(self.combined_data[:, :13], dim=0)[0].unsqueeze(-1).to(self.device)
+        else:
+             print("Warning: combined_data is None or has fewer than 13 columns. Cannot calculate observation bounds.")
+             self.obs_min = None
+             self.obs_max = None
+
+
+        self._batch_size = torch.Size([num_envs])
+
+        super().__init__(device=device, batch_size=self._batch_size)
+
+        self._make_specs()
+
+
+    def _is_terminal(self) -> torch.Tensor:
+        terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        return terminated
+
+
+    def _batch_reward(self, data_index: torch.Tensor, tensordict: TensorDictBase) -> TensorDictBase:
+        actions=tensordict.get(('agents', 'action'))
+
+        valid_indices_mask = data_index < self.combined_data.shape[0]
+
+        reward = torch.zeros(self.num_envs, self.num_agents, 1, dtype=torch.float32, device=self.device)
+
+        if valid_indices_mask.any():
+            valid_data_indices = data_index[valid_indices_mask]
+            returns_for_valid_envs = self.combined_data[valid_data_indices, self.num_agents : 2 * self.num_agents]
+            calculated_reward = torch.abs(returns_for_valid_envs).unsqueeze(-1)
+            reward[valid_indices_mask] = calculated_reward
+
+        reward_tensordict_output = TensorDict({
+            ('agents', 'reward'): reward
+        }, batch_size=self.batch_size, device=self.device)
+
+
+        return reward_tensordict_output
+
+
+    def _step(self, tensordict: TensorDictBase) -> TensorDictBase:
+        prev_done = tensordict.get("done", torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device))
+        if prev_done.shape[-1] == 1:
+             prev_done = prev_done.squeeze(-1)
+
+        self.current_data_index += (~prev_done).long()
+
+        terminated = self._is_terminal()
+        truncated = (self.current_data_index >= self.episode_length).squeeze(-1)
+
+        actions=tensordict.get(('agents', 'action'))
+        reward_td = self._batch_reward(self.current_data_index, tensordict)
+
+        num_envs = self.current_data_index.shape[0]
+
+        next_data_indices = torch.min(self.current_data_index + 1, torch.as_tensor(self.combined_data.shape[0] - 1, device=self.device))
+
+        x_data_time_step = self.combined_data[next_data_indices, :self.node_feature_dim]
+
+        x_data = x_data_time_step.unsqueeze(1).expand(-1, self.num_agents, -1).clone()
+
+        edge_index_data = self._fixed_edge_index_single.unsqueeze(0).repeat(num_envs, 1, 1).to(self.device).clone()
+
+        batch_data = torch.arange(num_envs, device=self.device).repeat_interleave(self.num_agents).view(num_envs, self.num_agents).clone()
+
+        time_data = (self.current_data_index).unsqueeze(-1).to(self.device).clone()
+
+
+        next_state_tensordict_data = TensorDict({
+             "x": x_data,
+             "edge_index": edge_index_data,
+             "batch": batch_data,
+             "time": time_data,
+        }, batch_size=self.batch_size, device=self.device)
+
+
+        next_policy_rnn_hidden_state = tensordict.get(('agents', 'rnn_hidden_state'), None)
+        next_forecast_rnn_hidden_state = tensordict.get(('agents', 'rnn_hidden_state_forecast'), None)
+        next_value_rnn_hidden_state = tensordict.get(('agents', 'rnn_hidden_state_value'), None)
+
+        next_policy_rnn_hidden_state_cloned = next_policy_rnn_hidden_state.clone() if next_policy_rnn_hidden_state is not None else None
+        next_forecast_rnn_hidden_state_cloned = next_forecast_rnn_hidden_state.clone() if next_forecast_rnn_hidden_state is not None else None
+        next_value_rnn_hidden_state_cloned = next_value_rnn_hidden_state.clone() if next_value_rnn_hidden_state is not None else None
+
+
+        output_tensordict = TensorDict({
+            ("agents", "data"): next_state_tensordict_data,
+            ('agents', 'reward'): reward_td.get(('agents', 'reward')),
+            "terminated": terminated.unsqueeze(-1).clone(),
+            "truncated": truncated.unsqueeze(-1).clone(),
+            "done": (terminated | truncated).unsqueeze(-1).clone(),
+
+            ("agents", "rnn_hidden_state"): next_policy_rnn_hidden_state_cloned,
+            ("agents", "rnn_hidden_state_forecast"): next_forecast_rnn_hidden_state_cloned,
+            ("agents", "rnn_hidden_state_value"): next_value_rnn_hidden_state_cloned,
+
+
+        }, batch_size=self.batch_size, device=self.device)
+
+
+        return output_tensordict
+
+
+    def _reset(self, tensordict: Optional[TensorDictBase] = None) -> TensorDictBase:
+        if self.allow_repeat_data and self.combined_data is not None:
+             max_start_index = self.combined_data.shape[0] - self.episode_length -1
+             if max_start_index < 0:
+                  self.current_data_index = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
+             else:
+                  self.current_data_index = torch.randint(0, max_start_index + 1, (self.num_envs,), dtype=torch.int64, device=self.device)
+        else:
+             if not hasattr(self, '_global_data_index'):
+                 self._global_data_index = 0
+
+             required_data_points = self.episode_length + 1
+             if self._global_data_index + required_data_points > self.combined_data.shape[0]:
+                 self._global_data_index = 0
+
+             self.current_data_index = torch.full((self.num_envs,), self._global_data_index, dtype=torch.int64, device=self.device)
+
+             self._global_data_index += 1
+
+
+        data_indices = self.current_data_index
+
+        x_data_time_step = self.combined_data[data_indices, :self.node_feature_dim]
+
+        x_data = x_data_time_step.unsqueeze(1).expand(-1, self.num_agents, -1).clone()
+
+
+        edge_index_data = self._fixed_edge_index_single.unsqueeze(0).repeat(self.num_envs, 1, 1).to(self.device).clone()
+
+        batch_data = torch.arange(self.num_envs, device=self.device).repeat_interleave(self.num_agents).view(self.num_envs, self.num_agents).clone()
+
+        time_data = torch.zeros(self.num_envs, 1, dtype=torch.int64, device=self.device).clone()
+
+
+        output_tensordict = TensorDict({
+            ("agents", "data"): TensorDict({
+                 "x": x_data.clone(),
+                 "edge_index": edge_index_data.clone() if edge_index_data is not None else None,
+                 "batch": batch_data.clone(),
+                 "time": time_data.clone(),
+            }, batch_size=self.batch_size, device=self.device),
+
+            "terminated": torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device).clone(),
+            "truncated": torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device).clone(),
+            "done": torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device).clone(),
+
+            ("agents", "rnn_hidden_state"): torch.zeros(self.num_envs, self.num_agents, 64, device=self.device, dtype=torch.float32).clone(),
+            ("agents", "rnn_hidden_state_forecast"): torch.zeros(self.num_envs, self.num_agents, 64, device=self.device, dtype=torch.float32).clone(),
+            ("agents", "rnn_hidden_state_value"): torch.zeros(self.num_envs, self.num_agents, 64, device=self.device, dtype=torch.float32).clone(),
+
+
+        }, batch_size=self.batch_size, device=self.device)
+
+
+        return output_tensordict
+
+    @property
+    def episode_length(self):
+        return self._episode_length
+
+    @property
+    def batch_size(self):
+        return self._batch_size
+
+# --- Code to instantiate the evaluation environment ---
+# Note: You will need to define num_envs, seed, device, and num_agents
+# in your new notebook before running this code.
+
+# Example instantiation (replace with your actual parameter values):
+# num_envs = 2
+# seed = 42
+# device = 'cpu' # or 'cuda'
+# num_agents = 5
+# episode_length_eval = 100 # Or get from training setup if available
+
+# print("Creating evaluation environment...")
+# try:
+#     eval_env = FuelpriceEnv(num_envs=num_envs, seed=seed, device=device, num_agents=num_agents, episode_length=episode_length_eval)
+#     print("\nEvaluation environment instantiated successfully.")
+# except Exception as e:
+#     eval_env = None
+#     print(f"\nAn error occurred during evaluation environment instantiation: {e}")
+
+
+# --- Code to load the trained policy ---
+# Note: You will need to ensure policy_module_gcn is defined and
+# the policy_model.pth file is available. This typically means
+# you would have run the training process and saved the model.
+
+# Example loading (replace with your actual policy module instance and path):
+# if 'policy_module_gcn' in locals() and policy_module_gcn is not None:
+#     policy_model_path = "policy_model.pth"
+#     if os.path.exists(policy_model_path):
+#         print(f"\nLoading state dictionary from {policy_model_path} into policy_module_gcn...")
+#         try:
+#             policy_module_gcn.load_state_dict(torch.load(policy_model_path))
+#             print("Policy module state dictionary loaded successfully.")
+#         except Exception as e:
+#             print(f"An error occurred while loading the policy module state dictionary: {e}")
+#     else:
+#         print(f"\nSaved policy model file not found at {policy_model_path}. Cannot load state dictionary.")
+# else:
+#     print("\nPolicy module (policy_module_gcn) is not available. Cannot load state dictionary.")
+
+
+# --- Code to set up the evaluation collector ---
+# Note: You will need eval_env and combined_module_wrapped_gcn defined
+# before running this code. combined_module_wrapped_gcn wraps the
+# policy_module_gcn and forecasting_module_gcn.
+
+# Example instantiation (replace with your actual parameters):
+# if eval_env is None or combined_module_wrapped_gcn is None:
+#     print("Evaluation environment or combined wrapped policy module not available. Cannot instantiate evaluation collector.")
+#     eval_collector = None
+# else:
+#     print("\nInstantiating evaluation SyncDataCollector...")
+#     try:
+#         eval_frames_per_batch = eval_env.episode_length
+#         num_eval_episodes = 10
+#         eval_total_frames = eval_env.episode_length * num_eval_episodes
+
+#         eval_collector = SyncDataCollector(
+#             eval_env,
+#             policy=combined_module_wrapped_gcn,
+#             frames_per_batch=eval_frames_per_batch,
+#             total_frames=eval_total_frames,
+#             device=device,
+#             storing_device=device
+#         )
+#         print("\nEvaluation SyncDataCollector instantiated successfully.")
+#     except Exception as e:
+#         eval_collector = None
+#         print(f"\nAn error occurred during evaluation SyncDataCollector instantiation: {e}")
