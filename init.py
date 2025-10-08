@@ -8,6 +8,8 @@ from .Fuel_Price_Environment import Evaluate_Trained_Policy.py
 from .Fuel_Price_Environment import Hyperparamters_Grid_Search.py 
 from .Fuel_Price_Environment import Implement_training_loop.py
 from .Fuel_Price_Environment import Optimizer_Adams.py
+from .Fuel_Price_Environment import Evaluation_Fuel_Price_Environment.py
+
 
 
 
