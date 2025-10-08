@@ -162,7 +162,7 @@ class FuelpriceenvfeatureGraph():
              raise # Re-raise the exception to stop execution
 
 
-class Eval_FuelpriceEnv(EnvBase):
+class FuelpriceEnv(EnvBase):
     def __init__(self, num_envs, seed, device, num_agents=13, **kwargs): # Added num_agents argument with default
         self.episode_length = kwargs.get('episode_length', 100)
         self.num_agents = num_agents # Use the provided num_agents
